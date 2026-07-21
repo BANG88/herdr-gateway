@@ -1987,6 +1987,7 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
             &session,
             &mut statuses,
             &state.config.server_id,
+            &state.config.label,
             &session.id,
         )
         .await
@@ -2011,6 +2012,7 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
                                 &event,
                                 &mut statuses,
                                 &state.config.server_id,
+                                &state.config.label,
                                 &session.id,
                             ) {
                                 deliver_agent_notification(&state, notification).await;
@@ -2041,6 +2043,7 @@ async fn poll_agent_notifications(
     session: &SessionConfig,
     statuses: &mut HashMap<String, String>,
     server_id: &str,
+    server_label: &str,
     session_id: &str,
 ) -> Vec<AgentPushNotification> {
     let Ok(value) = herdr_request(session, "agent.list", json!({})).await else {
@@ -2059,6 +2062,7 @@ async fn poll_agent_notifications(
                 }),
                 statuses,
                 server_id,
+                server_label,
                 session_id,
             )
         })
@@ -2107,6 +2111,7 @@ fn notification_for_agent_status_event(
     event: &Value,
     statuses: &mut HashMap<String, String>,
     server_id: &str,
+    server_label: &str,
     session_id: &str,
 ) -> Option<AgentPushNotification> {
     let data = event.get("data").unwrap_or(event);
@@ -2125,10 +2130,10 @@ fn notification_for_agent_status_event(
         return None;
     }
 
-    let (event_type, title, message) = match (status.as_str(), previous.as_deref()) {
+    let (event_type, status_label, message) = match (status.as_str(), previous.as_deref()) {
         ("blocked", _) => ("agent.blocked", "Agent blocked", "needs your input."),
         ("idle" | "done" | "completed", Some("working")) => {
-            ("agent.completed", "Agent completed", "finished running.")
+            ("agent.completed", "Agent done", "finished running.")
         }
         _ => return None,
     };
@@ -2137,6 +2142,15 @@ fn notification_for_agent_status_event(
         .find_map(|key| data.get(key).and_then(Value::as_str))
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("Agent");
+    // Title carries which server so a multi-server user knows where to look;
+    // body carries which agent and what happened. Only the server label (which
+    // the user set) and the agent name -- never terminal output or prompts.
+    let server = server_label.trim();
+    let title = if server.is_empty() {
+        status_label.to_string()
+    } else {
+        format!("{status_label} · {}", truncate(server, 32))
+    };
     let mut notification_data = serde_json::Map::new();
     notification_data.insert("type".into(), json!(event_type));
     notification_data.insert("url".into(), json!(format!("/servers/{server_id}")));
@@ -2145,7 +2159,7 @@ fn notification_for_agent_status_event(
     notification_data.insert("pane_id".into(), json!(pane_id));
 
     Some(AgentPushNotification {
-        title: title.into(),
+        title,
         body: format!("{} {message}", agent_name.trim()),
         data: notification_data,
     })
@@ -4068,14 +4082,14 @@ mod tests {
         });
         let mut statuses = HashMap::new();
         let notification =
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "default")
+            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default")
                 .unwrap();
-        assert_eq!(notification.title, "Agent blocked");
+        assert_eq!(notification.title, "Agent blocked · Studio");
         assert_eq!(notification.body, "Codex needs your input.");
         assert_eq!(notification.data["type"], "agent.blocked");
         assert_eq!(notification.data["url"], "/servers/server-1");
         assert!(
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "default",)
+            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default",)
                 .is_none()
         );
     }
@@ -4092,9 +4106,9 @@ mod tests {
             }
         });
         let notification =
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "default")
+            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default")
                 .unwrap();
-        assert_eq!(notification.title, "Agent completed");
+        assert_eq!(notification.title, "Agent done · Studio");
         assert_eq!(notification.body, "codex finished running.");
         assert_eq!(notification.data["type"], "agent.completed");
         assert_eq!(notification.data["pane_id"], "w1:p2");
@@ -4108,7 +4122,7 @@ mod tests {
             "data": { "pane_id": "w1:p2", "agent_status": "idle" }
         });
         assert!(
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "default",)
+            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default",)
                 .is_none()
         );
         assert_eq!(statuses.get("w1:p2").map(String::as_str), Some("idle"));
