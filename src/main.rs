@@ -176,6 +176,8 @@ struct PublicUrlSelection {
 struct PendingPairing {
     request_id: String,
     device_name: String,
+    #[serde(default)]
+    install_id: Option<String>,
     code: String,
     code_hash: String,
     created_unix_ms: u128,
@@ -194,6 +196,11 @@ enum PairingCodeError {
 struct PairRequestBody {
     request_id: String,
     device_name: Option<String>,
+    /// A stable per-install identifier from the client. When present, a new
+    /// pairing replaces any earlier device with the same value, so re-pairing a
+    /// device does not leave a duplicate record behind.
+    #[serde(default)]
+    install_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -220,6 +227,10 @@ struct DeviceRecord {
     paired_unix_ms: u128,
     #[serde(default)]
     last_seen_unix_ms: u128,
+    /// The client's stable install identifier, used to replace an earlier
+    /// record for the same device instead of piling up duplicates.
+    #[serde(default)]
+    install_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -810,9 +821,15 @@ async fn pair_request(
     record_pairing_request(&state, now)?;
 
     let code = generate_pairing_code();
+    let install_id = body
+        .install_id
+        .as_deref()
+        .filter(|value| valid_install_id(value))
+        .map(str::to_owned);
     let pending = PendingPairing {
         request_id: body.request_id.clone(),
         device_name,
+        install_id,
         code: code.clone(),
         code_hash: hash_token(&code),
         created_unix_ms: now,
@@ -851,7 +868,7 @@ async fn pair_claim(
     State(state): State<AppState>,
     Json(body): Json<PairClaimBody>,
 ) -> ApiResult<Json<Value>> {
-    let device_name = {
+    let (device_name, install_id) = {
         let mut pending = state.pending_pairing.lock().map_err(|_| {
             api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -863,6 +880,7 @@ async fn pair_claim(
             .as_ref()
             .map(|value| value.device_name.clone())
             .unwrap_or_else(|| "Muqun app".into());
+        let install_id = pending.as_ref().and_then(|value| value.install_id.clone());
         let code = body.code.trim().to_ascii_uppercase();
         consume_pairing_code(&mut pending, &body.request_id, &code, now_unix_ms()).map_err(
             |error| match error {
@@ -883,7 +901,7 @@ async fn pair_claim(
                 ),
             },
         )?;
-        device_name
+        (device_name, install_id)
     };
 
     // Each device gets its own token so it can be revoked without disturbing
@@ -895,9 +913,15 @@ async fn pair_claim(
         token_hash: hash_token(&token),
         paired_unix_ms: now_unix_ms(),
         last_seen_unix_ms: now_unix_ms(),
+        install_id: install_id.clone(),
     };
     {
         let mut devices = lock_devices(&state)?;
+        // One record per install: replace an earlier pairing from the same
+        // device rather than accumulating duplicates.
+        if let Some(install_id) = install_id.as_deref() {
+            devices.retain(|device| device.install_id.as_deref() != Some(install_id));
+        }
         devices.push(record);
         devices.sort_by_key(|item| item.paired_unix_ms);
         if devices.len() > MAX_DEVICES {
@@ -1483,6 +1507,10 @@ fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> {
             .and_then(Value::as_str)
             .unwrap_or("Muqun app")
             .into(),
+        install_id: value
+            .get("install_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         code: value
             .get("code")
             .and_then(Value::as_str)
@@ -3110,6 +3138,16 @@ fn valid_pairing_code(code: &str) -> bool {
 
 /// Device names are echoed into the manage UI's terminal box, so control
 /// characters (ANSI escapes in particular) are rejected outright.
+/// A client install identifier: an opaque token the app generates once and
+/// keeps. Bounded and control-character-free like every other client string.
+fn valid_install_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn valid_device_name(value: &str) -> bool {
     !value.is_empty()
         && value.chars().count() <= MAX_DEVICE_NAME_CHARS
@@ -3465,6 +3503,7 @@ mod tests {
             paired_unix_ms: 1_000,
             // Fresh enough that require_device will not flush to disk.
             last_seen_unix_ms: now_unix_ms(),
+            install_id: None,
         }
     }
 
@@ -3697,6 +3736,7 @@ mod tests {
         Some(PendingPairing {
             request_id: "request-1".into(),
             device_name: "Muqun test".into(),
+            install_id: None,
             code_hash: hash_token(&code),
             code,
             created_unix_ms,
