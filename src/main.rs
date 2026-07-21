@@ -58,7 +58,7 @@ const MAX_OUTPUT_LINES: u32 = 5000;
 const MAX_SEND_TEXT_BYTES: usize = 64 * 1024;
 const PAIRING_CODE_CHARACTER_COUNT: usize = 8;
 const PAIRING_CODE_LENGTH: usize = PAIRING_CODE_CHARACTER_COUNT + 1;
-const PAIRING_CODE_TTL_MS: u128 = 2 * 60 * 1000;
+const PAIRING_CODE_TTL_MS: u128 = 5 * 60 * 1000;
 const MAX_PAIRING_CODE_ATTEMPTS: u8 = 8;
 const PAIRING_RATE_LIMIT_WINDOW_MS: u128 = 10 * 60 * 1000;
 const MAX_PAIRING_REQUESTS_PER_WINDOW: usize = 6;
@@ -1223,14 +1223,26 @@ fn manage() -> anyhow::Result<()> {
     let _terminal = TerminalModeGuard::enter()?;
     let mut message = auto_upgrade_local_public_url()?.unwrap_or_else(|| String::from("ready"));
     let mut pending_pairing = fetch_pending_pairing().ok().flatten();
-    print_manage_screen(&message, pending_pairing.as_ref())?;
+    let mut devices = read_devices().unwrap_or_default();
+    // False by default so a finished pairing lands on the device list; `p` flips
+    // it on to add another device.
+    let mut show_qr = false;
+    print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
 
     loop {
         if !poll_event(MANAGE_REFRESH_INTERVAL)? {
             let next_pending_pairing = fetch_pending_pairing().ok().flatten();
-            if next_pending_pairing != pending_pairing {
+            let next_devices = read_devices().unwrap_or_default();
+            if next_pending_pairing != pending_pairing || next_devices != devices {
+                // A newly paired device flips off the QR so the screen settles on
+                // the device list instead of showing a fresh code.
+                if next_devices.len() > devices.len() {
+                    show_qr = false;
+                    message = String::from("device paired");
+                }
                 pending_pairing = next_pending_pairing;
-                print_manage_screen(&message, pending_pairing.as_ref())?;
+                devices = next_devices;
+                print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
             }
             continue;
         }
@@ -1238,7 +1250,7 @@ fn manage() -> anyhow::Result<()> {
         let event = read_event()?;
         let TerminalEvent::Key(event) = event else {
             if matches!(event, TerminalEvent::Resize(_, _)) {
-                print_manage_screen(&message, pending_pairing.as_ref())?;
+                print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
             }
             continue;
         };
@@ -1260,7 +1272,12 @@ fn manage() -> anyhow::Result<()> {
                 stop_background_inner(false)?;
                 message = String::from("stop requested");
             }
+            "p" | "pair" => {
+                show_qr = true;
+                message = String::from("scan to pair another device");
+            }
             "r" | "refresh" | "" => {
+                show_qr = false;
                 message = String::from("refreshed");
             }
             "u" | "url" => match prompt_public_url()? {
@@ -1282,7 +1299,8 @@ fn manage() -> anyhow::Result<()> {
         }
 
         pending_pairing = fetch_pending_pairing().ok().flatten();
-        print_manage_screen(&message, pending_pairing.as_ref())?;
+        devices = read_devices().unwrap_or_default();
+        print_manage_screen(&message, pending_pairing.as_ref(), &devices, show_qr)?;
     }
     Ok(())
 }
@@ -1399,6 +1417,8 @@ impl Drop for TerminalModeGuard {
 fn print_manage_screen(
     message: &str,
     pending_pairing: Option<&PendingPairing>,
+    devices: &[DeviceRecord],
+    show_qr: bool,
 ) -> anyhow::Result<()> {
     execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
     let config = load_config(None).ok();
@@ -1419,7 +1439,7 @@ fn print_manage_screen(
     let mut lines = vec![
         String::from("Herdr Gateway for Muqun"),
         String::from(""),
-        String::from("keys   : s start | t stop | u url | a auto | r refresh | q quit"),
+        String::from("keys   : s start | t stop | u url | a auto | p pair | r refresh | q quit"),
         format!("server : {server}"),
         format!("url    : {url}"),
         format!("status : {status}"),
@@ -1427,6 +1447,7 @@ fn print_manage_screen(
         String::from(""),
     ];
 
+    // A device mid-pairing takes priority: show its name + the code to enter.
     if let Some(pending) = pending_pairing {
         lines.extend([
             String::from("Pairing request"),
@@ -1435,6 +1456,27 @@ fn print_manage_screen(
             String::from(""),
             String::from("Enter this code in Muqun to finish pairing."),
         ]);
+        write_centered_box(&lines)?;
+        return Ok(());
+    }
+
+    // Once at least one device is paired, the QR is not the default view -- a
+    // finished pairing should land on the device list, not another QR. `p` (or a
+    // fresh install with nothing paired yet) brings the QR back to add another.
+    let show_qr = show_qr || devices.is_empty();
+
+    if !show_qr {
+        lines.push(format!("Paired devices ({})", devices.len()));
+        lines.push(String::from(""));
+        for device in devices.iter().rev() {
+            lines.push(format!(
+                "  {}   paired {}",
+                truncate(&device.name, 40),
+                relative_since(device.paired_unix_ms)
+            ));
+        }
+        lines.push(String::from(""));
+        lines.push(String::from("Press p to pair another device."));
         write_centered_box(&lines)?;
         return Ok(());
     }
@@ -1457,6 +1499,26 @@ fn print_manage_screen(
     }
     write_centered_box(&lines)?;
     Ok(())
+}
+
+/// A compact "3m ago" / "2h ago" / "5d ago" for the manage device list. Falls
+/// back to "just now" for anything under a minute and "recently" if the clock
+/// looks off (a future timestamp).
+fn relative_since(then_unix_ms: u128) -> String {
+    let now = now_unix_ms();
+    if then_unix_ms > now {
+        return String::from("recently");
+    }
+    let secs = (now - then_unix_ms) / 1000;
+    if secs < 60 {
+        String::from("just now")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
 
 fn push_line(output: &mut String, line: impl AsRef<str>) {
