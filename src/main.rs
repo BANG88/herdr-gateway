@@ -1827,8 +1827,13 @@ struct StreamOutputOpts {
 /// Pulls the terminal text out of a Herdr `pane.read` response, tolerating both
 /// the bare-string and `{ text: ... }` result shapes across Herdr versions.
 fn pane_read_text(value: &Value) -> Option<String> {
-    if let Some(text) = value.pointer("/result/text").and_then(Value::as_str) {
-        return Some(text.to_owned());
+    // Herdr nests the text under `result.read.text`; tolerate `result.text` and a
+    // bare-string `result` too across versions. Missing all three means no inline
+    // output and the client falls back to its own read.
+    for ptr in ["/result/read/text", "/result/text"] {
+        if let Some(text) = value.pointer(ptr).and_then(Value::as_str) {
+            return Some(text.to_owned());
+        }
     }
     value.pointer("/result").and_then(Value::as_str).map(str::to_owned)
 }
