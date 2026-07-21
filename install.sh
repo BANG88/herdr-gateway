@@ -34,9 +34,18 @@ if ! command -v cargo >/dev/null 2>&1; then
   die "Install Rust, open a new shell, then run this again."
 fi
 
-# 4. Install or update. The command is identical either way; a reinstall pulls
-#    the latest and rebuilds. --yes keeps a piped run non-interactive.
-if herdr plugin list 2>/dev/null | grep -q "$PLUGIN_ID"; then
+# 4. Install or update. Reinstalling a GitHub-managed plugin replaces its
+#    checkout in place -- no uninstall needed. A local dev link is the one case
+#    Herdr refuses to install over, so detect it and explain instead of failing.
+existing="$(herdr plugin list 2>/dev/null | grep "$PLUGIN_ID" || true)"
+if printf '%s' "$existing" | grep -q '\[local:'; then
+  warn "Herdr Gateway is installed as a local dev link, not a GitHub plugin."
+  echo "   Update that checkout in place:"
+  echo "     git -C <your-checkout> pull && cargo build --release"
+  echo "   Or switch to the GitHub-managed version:"
+  echo "     herdr plugin unlink $PLUGIN_ID && herdr plugin install $REPO --yes"
+  exit 0
+elif [ -n "$existing" ]; then
   info "Herdr Gateway is already installed -- updating to the latest..."
 else
   info "Installing Herdr Gateway..."

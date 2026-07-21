@@ -56,8 +56,9 @@ herdr plugin action invoke herdr.gateway.stop
 
 ## Update
 
-Herdr has no separate update step -- reinstalling refreshes a managed plugin to
-the latest. Re-run the same one command:
+Herdr has no separate update step, and **you do not need to uninstall first** --
+reinstalling a GitHub-managed plugin replaces its checkout in place. Re-run the
+same one command:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
@@ -81,6 +82,11 @@ After updating, restart the gateway so the new build takes over:
 herdr plugin action invoke herdr.gateway.stop
 herdr plugin action invoke herdr.gateway.start
 ```
+
+> Working from a local checkout (`herdr plugin link .`)? Herdr refuses to install
+> over a local link, so update it in place with `git pull && cargo build
+> --release` instead, or `herdr plugin unlink herdr.gateway` first to switch to
+> the GitHub-managed build.
 
 ## Development
 
