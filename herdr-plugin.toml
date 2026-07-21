@@ -5,8 +5,10 @@ min_herdr_version = "0.7.0"
 description = "Expose a token-protected mobile gateway API for Herdr."
 platforms = ["linux", "macos"]
 
+# Downloads a prebuilt binary for this OS/arch (no Rust needed), and only
+# compiles from source when no matching release binary is published.
 [[build]]
-command = ["cargo", "build", "--release"]
+command = ["sh", "scripts/fetch-binary.sh"]
 
 [[actions]]
 id = "setup"

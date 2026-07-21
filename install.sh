@@ -26,12 +26,11 @@ esac
 command -v herdr >/dev/null 2>&1 \
   || die "Herdr is not installed. Get it from https://herdr.dev first."
 
-# 3. Rust builds the gateway during install. Point at the one-liner if missing.
+# 3. Install downloads a prebuilt binary, so Rust is optional -- only needed as
+#    a fallback when no release binary matches this OS/arch.
 if ! command -v cargo >/dev/null 2>&1; then
-  warn "Rust (cargo) is required to build the gateway and was not found."
-  echo "   Install it with:"
-  echo "     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
-  die "Install Rust, open a new shell, then run this again."
+  warn "Rust (cargo) not found. That is fine -- a prebuilt binary will be used."
+  echo "   (If none matches your platform, install Rust from https://rustup.rs and retry.)"
 fi
 
 # 4. Install or update. Reinstalling a GitHub-managed plugin replaces its

@@ -16,8 +16,9 @@ Windows is not supported yet):
 curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
 ```
 
-It needs [Herdr](https://herdr.dev) and a Rust toolchain (`cargo`), and points
-you at how to get either if it is missing.
+It needs [Herdr](https://herdr.dev). Install downloads a prebuilt binary for
+your platform, so no Rust toolchain is required -- it is only used as a fallback
+if no release binary matches your OS/arch.
 
 Or install directly with Herdr's plugin installer:
 
