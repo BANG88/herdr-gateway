@@ -1,0 +1,28 @@
+[package]
+name = "herdr-gateway"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Token-protected mobile gateway for Herdr, the terminal workspace manager for AI coding agents."
+repository = "https://github.com/BANG88/herdr-gateway"
+readme = "README.md"
+keywords = ["herdr", "terminal", "gateway", "tailscale", "cli"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+anyhow = "1.0.103"
+async-stream = "0.3.6"
+axum = "0.8.9"
+base64 = "0.22.1"
+clap = { version = "4.6.2", features = ["derive"] }
+crossterm = "0.29.0"
+dirs = "6.0.0"
+libc = "0.2.178"
+qrcode = "0.14.1"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10.9"
+tokio = { version = "1.53.0", features = ["macros", "net", "rt-multi-thread", "io-util"] }
+tokio-stream = "0.1.18"
+uuid = { version = "1.24.0", features = ["v4"] }
