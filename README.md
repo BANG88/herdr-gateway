@@ -9,7 +9,17 @@ such as Tailscale.
 
 ## Install
 
-Install from GitHub with Herdr's plugin installer:
+One command that checks your system and installs the plugin (macOS and Linux;
+Windows is not supported yet):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
+```
+
+It needs [Herdr](https://herdr.dev) and a Rust toolchain (`cargo`), and points
+you at how to get either if it is missing.
+
+Or install directly with Herdr's plugin installer:
 
 ```sh
 herdr plugin install BANG88/herdr-gateway
@@ -42,6 +52,34 @@ Stop the gateway:
 
 ```sh
 herdr plugin action invoke herdr.gateway.stop
+```
+
+## Update
+
+Herdr has no separate update step -- reinstalling refreshes a managed plugin to
+the latest. Re-run the same one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
+```
+
+or reinstall directly:
+
+```sh
+herdr plugin install BANG88/herdr-gateway
+```
+
+Pin a specific version with `--ref`:
+
+```sh
+herdr plugin install BANG88/herdr-gateway --ref v0.3.0
+```
+
+After updating, restart the gateway so the new build takes over:
+
+```sh
+herdr plugin action invoke herdr.gateway.stop
+herdr plugin action invoke herdr.gateway.start
 ```
 
 ## Development
