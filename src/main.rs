@@ -1739,6 +1739,73 @@ struct EventsQuery {
     /// phone. Absent means forward everything, so an old client is unaffected.
     #[serde(default)]
     types: Option<String>,
+    /// When set, `pane.updated` events for THIS pane are enriched with the
+    /// pane's current output inline, so the client paints immediately instead of
+    /// firing a second read round-trip per update. Other panes' events, and all
+    /// other event types, pass through unchanged. Absent means no enrichment, so
+    /// an old client still works via its own reads.
+    #[serde(default)]
+    stream_pane: Option<String>,
+    #[serde(default)]
+    stream_lines: Option<u32>,
+    #[serde(default)]
+    stream_source: Option<String>,
+    #[serde(default)]
+    stream_format: Option<String>,
+}
+
+/// Resolved output-streaming settings for one events subscription.
+struct StreamOutputOpts {
+    pane: Option<String>,
+    lines: u32,
+    source: String,
+    format: String,
+}
+
+/// Pulls the terminal text out of a Herdr `pane.read` response, tolerating both
+/// the bare-string and `{ text: ... }` result shapes across Herdr versions.
+fn pane_read_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.pointer("/result/text").and_then(Value::as_str) {
+        return Some(text.to_owned());
+    }
+    value.pointer("/result").and_then(Value::as_str).map(str::to_owned)
+}
+
+/// If `line` is a `pane.updated` for the streamed pane, read that pane's output
+/// and fold it into the event as `data.output`. Returns `None` to forward the
+/// line untouched (wrong pane, wrong event, or a read failure -- the client
+/// still has its revision and can fall back to a read).
+async fn enrich_pane_update(
+    line: &str,
+    session: &SessionConfig,
+    opts: &StreamOutputOpts,
+) -> Option<String> {
+    let pane = opts.pane.as_deref()?;
+    let mut value: Value = serde_json::from_str(line).ok()?;
+    if normalize_event_name(value.get("event")?.as_str()?) != "pane_updated" {
+        return None;
+    }
+    if value.pointer("/data/pane/pane_id").and_then(Value::as_str)? != pane {
+        return None;
+    }
+    let read = herdr_request(
+        session,
+        "pane.read",
+        json!({
+            "pane_id": pane,
+            "source": opts.source,
+            "lines": opts.lines,
+            "format": opts.format,
+        }),
+    )
+    .await
+    .ok()?;
+    let text = pane_read_text(&read)?;
+    value
+        .get_mut("data")
+        .and_then(Value::as_object_mut)?
+        .insert("output".into(), Value::String(text));
+    serde_json::to_string(&value).ok()
 }
 
 /// Normalises a filter token to the underscore form Herdr tags events with, so
@@ -1775,6 +1842,18 @@ async fn events(
             .filter(|name| !name.is_empty())
             .collect()
     });
+    let stream_opts = StreamOutputOpts {
+        pane: query.stream_pane.clone().filter(|value| !value.is_empty()),
+        lines: query.stream_lines.unwrap_or(240).min(MAX_OUTPUT_LINES),
+        source: match query.stream_source.as_deref() {
+            Some("recent-unwrapped") | Some("recent_unwrapped") | None => "recent_unwrapped".into(),
+            Some(other) => other.to_string(),
+        },
+        format: match query.stream_format.as_deref() {
+            Some("text") => "text".into(),
+            _ => "ansi".into(),
+        },
+    };
     let stream = async_stream::stream! {
         match herdr_event_stream(&session).await {
             Ok(mut reader) => {
@@ -1797,7 +1876,18 @@ async fn events(
                                     None => true,
                                 };
                                 if keep {
-                                    yield Ok(Event::default().event("herdr").data(data.to_owned()));
+                                    // Fold the viewed pane's output into its
+                                    // update so the client paints on arrival,
+                                    // with no follow-up read hop. Everything
+                                    // else forwards untouched.
+                                    let payload = if stream_opts.pane.is_some() {
+                                        enrich_pane_update(data, &session, &stream_opts)
+                                            .await
+                                            .unwrap_or_else(|| data.to_owned())
+                                    } else {
+                                        data.to_owned()
+                                    };
+                                    yield Ok(Event::default().event("herdr").data(payload));
                                 }
                             }
                         }
