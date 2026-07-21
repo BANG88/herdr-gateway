@@ -58,47 +58,42 @@ else
 fi
 herdr plugin install "$REPO" --yes
 
-# 5. First-run setup / update reload. These go through `herdr plugin action`, so
-#    they need a live herdr session; if that fails we fall back to printing the
-#    manual commands instead of leaving the user with a half-finished install.
+# 5. Configure, (re)load, and show the pairing QR. setup is idempotent -- it
+#    keeps an existing server id, token, and URL, so running it every time is
+#    safe (paired devices survive) and also repairs an install whose earlier
+#    setup never completed. stop+start then reloads the freshly downloaded
+#    binary. All of this goes through herdr plugin actions and needs a live
+#    herdr session, so if that fails we print the manual commands instead of
+#    leaving a half-finished install.
 auto_done=0
-if [ -z "$existing" ]; then
-  info "First install -- configuring and starting the gateway..."
-  if herdr plugin action invoke "$PLUGIN_ID.setup" >/dev/null 2>&1; then
-    sleep 2   # setup runs in a herdr pane; let it write the config first
-    herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
-    sleep 1
-    herdr plugin pane open --plugin "$PLUGIN_ID" --entrypoint manage >/dev/null 2>&1 || true
-    auto_done=1
+info "Configuring and starting the gateway..."
+if herdr plugin action invoke "$PLUGIN_ID.setup" >/dev/null 2>&1; then
+  sleep 2   # setup runs in a herdr pane; let it write the config first
+  herdr plugin action invoke "$PLUGIN_ID.stop"  >/dev/null 2>&1 || true
+  sleep 1
+  herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
+  sleep 1
+  herdr plugin pane open --plugin "$PLUGIN_ID" --entrypoint manage >/dev/null 2>&1 || true
+  auto_done=1
+  if [ -z "$existing" ]; then
     green "Herdr Gateway is configured, running, and showing the pairing QR."
   else
-    warn "Couldn't reach a herdr session to auto-configure."
+    green "Herdr Gateway updated, reloaded, and showing the pairing QR (pairings kept)."
   fi
 else
-  info "Reloading the gateway with the new binary (your paired devices are kept)..."
-  if herdr plugin action invoke "$PLUGIN_ID.stop" >/dev/null 2>&1; then
-    sleep 1
-    herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
-    auto_done=1
-    green "Herdr Gateway updated and restarted."
-  else
-    warn "Couldn't reach a herdr session to restart the gateway."
-  fi
+  warn "Couldn't reach a herdr session to configure the gateway."
 fi
 
 echo
-if [ "$auto_done" = "1" ] && [ -z "$existing" ]; then
+if [ "$auto_done" = "1" ]; then
   echo "The pairing QR is open in the herdr 'Gateway Manager' pane."
   echo "Scan it from the Muqun app on a device on the same Tailscale network."
   echo
   echo "Re-open the QR any time with:"
   echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
-elif [ "$auto_done" = "1" ]; then
-  echo "Re-open the pairing QR with:"
-  echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
 else
   warn "Run these from INSIDE herdr to finish:"
-  echo "  herdr plugin action invoke $PLUGIN_ID.setup    # first time only"
+  echo "  herdr plugin action invoke $PLUGIN_ID.setup"
   echo "  herdr plugin action invoke $PLUGIN_ID.start"
   echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
 fi

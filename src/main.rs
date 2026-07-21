@@ -359,26 +359,53 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("failed to create config dir {}", config_dir.display()))?;
 
-    let token = generate_token();
-    let public_url_selection = match public_url {
-        Some(url) => PublicUrlSelection {
-            url: validate_public_url(&url)?,
-            source: String::from("manual --public-url"),
-            listen_host: String::from("0.0.0.0"),
-        },
-        None => auto_public_url(port),
+    // Reuse an existing install's identity so re-running setup (after an update
+    // or a retry) refreshes settings without minting a new server id or token --
+    // that would orphan every already-paired device. Only a consistent config +
+    // pairing pair is trusted; a half-written state falls back to a fresh mint.
+    let existing = load_existing_identity(
+        &config_dir.join(CONFIG_FILE),
+        &config_dir.join(PAIRING_FILE),
+    );
+
+    let (server_id, token, token_hash) = match &existing {
+        Some(id) => (id.server_id.clone(), id.token.clone(), id.token_hash.clone()),
+        None => {
+            let token = generate_token();
+            let token_hash = hash_token(&token);
+            (uuid::Uuid::new_v4().to_string(), token, token_hash)
+        }
     };
-    let public_url = public_url_selection.url.clone();
+
+    // An explicit --public-url always wins. Otherwise a returning install keeps
+    // the URL and listen address it already has (including one set from the
+    // manage panel); only a fresh install auto-detects.
+    let (public_url, listen, url_source) = match (public_url, &existing) {
+        (Some(url), _) => (
+            validate_public_url(&url)?,
+            format!("0.0.0.0:{port}"),
+            String::from("manual --public-url"),
+        ),
+        (None, Some(id)) => (
+            id.public_url.clone(),
+            id.listen.clone(),
+            String::from("existing config"),
+        ),
+        (None, None) => {
+            let selection = auto_public_url(port);
+            (selection.url, format!("{}:{port}", selection.listen_host), selection.source)
+        }
+    };
     let socket_path = socket_path
         .or_else(|| std::env::var("HERDR_SOCKET_PATH").ok())
         .unwrap_or_else(default_socket_path);
 
     let config = Config {
-        server_id: uuid::Uuid::new_v4().to_string(),
+        server_id,
         label: hostname_label(),
-        listen: format!("{}:{port}", public_url_selection.listen_host),
+        listen,
         public_url: public_url.clone(),
-        token_hash: hash_token(&token),
+        token_hash,
         sessions: vec![SessionConfig {
             id: "default".into(),
             label: "Default".into(),
@@ -410,10 +437,7 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
 
     println!("wrote config: {}", path.display());
     println!("wrote pairing file: {}", pairing_path.display());
-    println!(
-        "public URL: {} ({})",
-        payload.url, public_url_selection.source
-    );
+    println!("public URL: {} ({url_source})", payload.url);
     if payload.url.contains("127.0.0.1") || payload.url.contains("localhost") {
         println!("warning: pairing URL is local-only; rerun setup after starting Tailscale or pass --public-url");
     }
@@ -422,6 +446,38 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     println!("scan this QR code from the mobile app:");
     println!("{image}");
     Ok(())
+}
+
+/// The parts of a prior install that setup preserves so a rerun keeps devices
+/// paired. Pulled from both files: the server id and admin token hash live in
+/// the config, the raw admin token lives in the pairing file.
+struct ExistingIdentity {
+    server_id: String,
+    token: String,
+    token_hash: String,
+    public_url: String,
+    listen: String,
+}
+
+fn load_existing_identity(
+    config_path: &std::path::Path,
+    pairing_path: &std::path::Path,
+) -> Option<ExistingIdentity> {
+    let config: Config = serde_json::from_slice(&std::fs::read(config_path).ok()?).ok()?;
+    let pairing: PairingFile = serde_json::from_slice(&std::fs::read(pairing_path).ok()?).ok()?;
+    // A config whose pairing file points at a different server is inconsistent;
+    // treat it as no identity so setup mints a clean one rather than stitching
+    // two mismatched halves together.
+    if pairing.payload.server_id != config.server_id {
+        return None;
+    }
+    Some(ExistingIdentity {
+        server_id: config.server_id,
+        token: pairing.payload.token,
+        token_hash: config.token_hash,
+        public_url: config.public_url,
+        listen: config.listen,
+    })
 }
 
 fn auto_public_url(port: u16) -> PublicUrlSelection {
