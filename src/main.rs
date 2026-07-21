@@ -1850,17 +1850,25 @@ async fn enrich_pane_update(
     if value.pointer("/data/pane/pane_id").and_then(Value::as_str)? != pane {
         return None;
     }
-    let read = herdr_request(
-        session,
-        "pane.read",
-        json!({
-            "pane_id": pane,
-            "source": opts.source,
-            "lines": opts.lines,
-            "format": opts.format,
-        }),
+    // Bound the read so a slow or wedged Herdr can never stall the event loop:
+    // a stalled enrich would starve the whole stream and drop the client back to
+    // its slow safety poll. On timeout we forward the un-enriched line and the
+    // client reads on its own.
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        herdr_request(
+            session,
+            "pane.read",
+            json!({
+                "pane_id": pane,
+                "source": opts.source,
+                "lines": opts.lines,
+                "format": opts.format,
+            }),
+        ),
     )
     .await
+    .ok()?
     .ok()?;
     let text = pane_read_text(&read)?;
     value
