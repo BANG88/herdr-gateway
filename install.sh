@@ -1,10 +1,16 @@
 #!/usr/bin/env sh
-# One-command install and update for the Herdr Gateway plugin.
+# One-command install, update, and first-run setup for the Herdr Gateway plugin.
 #
 #   curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
 #
-# Re-running updates to the latest: Herdr has no separate update step, so a
-# reinstall refreshes the managed plugin. macOS and Linux only for now.
+# Run this from INSIDE herdr (a herdr pane/session). The gateway lives as a
+# herdr plugin, so setup/start and the pairing QR are driven through herdr and
+# need a running herdr session to attach to.
+#
+# On a first install it also configures, starts, and opens the pairing QR for
+# you. Re-running just updates the plugin to the latest and reloads the binary;
+# it does NOT re-run setup, because setup mints a fresh server id + token and
+# that would orphan devices you have already paired. macOS and Linux only.
 set -eu
 
 REPO="BANG88/herdr-gateway"
@@ -22,12 +28,12 @@ case "$(uname -s)" in
   *)      die "Unsupported OS '$(uname -s)'. macOS and Linux only for now." ;;
 esac
 
-# 2. Herdr itself must be installed -- it hosts the plugin.
+# 2. Herdr itself must be installed -- it hosts the plugin and runs its actions.
 command -v herdr >/dev/null 2>&1 \
   || die "Herdr is not installed. Get it from https://herdr.dev first."
 
-# 3. Install downloads a prebuilt binary, so Rust is optional -- only needed as
-#    a fallback when no release binary matches this OS/arch.
+# 3. Install downloads a prebuilt, statically linked binary, so Rust is optional
+#    -- only needed as a fallback when no release binary matches this OS/arch.
 if ! command -v cargo >/dev/null 2>&1; then
   warn "Rust (cargo) not found. That is fine -- a prebuilt binary will be used."
   echo "   (If none matches your platform, install Rust from https://rustup.rs and retry.)"
@@ -36,6 +42,7 @@ fi
 # 4. Install or update. Reinstalling a GitHub-managed plugin replaces its
 #    checkout in place -- no uninstall needed. A local dev link is the one case
 #    Herdr refuses to install over, so detect it and explain instead of failing.
+#    `existing` (captured before install) also tells first-install from update.
 existing="$(herdr plugin list 2>/dev/null | grep "$PLUGIN_ID" || true)"
 if printf '%s' "$existing" | grep -q '\[local:'; then
   warn "Herdr Gateway is installed as a local dev link, not a GitHub plugin."
@@ -51,11 +58,47 @@ else
 fi
 herdr plugin install "$REPO" --yes
 
-green "Herdr Gateway is ready."
+# 5. First-run setup / update reload. These go through `herdr plugin action`, so
+#    they need a live herdr session; if that fails we fall back to printing the
+#    manual commands instead of leaving the user with a half-finished install.
+auto_done=0
+if [ -z "$existing" ]; then
+  info "First install -- configuring and starting the gateway..."
+  if herdr plugin action invoke "$PLUGIN_ID.setup" >/dev/null 2>&1; then
+    sleep 2   # setup runs in a herdr pane; let it write the config first
+    herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
+    sleep 1
+    herdr plugin pane open --plugin "$PLUGIN_ID" --entrypoint manage >/dev/null 2>&1 || true
+    auto_done=1
+    green "Herdr Gateway is configured, running, and showing the pairing QR."
+  else
+    warn "Couldn't reach a herdr session to auto-configure."
+  fi
+else
+  info "Reloading the gateway with the new binary (your paired devices are kept)..."
+  if herdr plugin action invoke "$PLUGIN_ID.stop" >/dev/null 2>&1; then
+    sleep 1
+    herdr plugin action invoke "$PLUGIN_ID.start" >/dev/null 2>&1 || true
+    auto_done=1
+    green "Herdr Gateway updated and restarted."
+  else
+    warn "Couldn't reach a herdr session to restart the gateway."
+  fi
+fi
+
 echo
-echo "Next steps:"
-echo "  1. Configure it once:   herdr plugin action invoke $PLUGIN_ID.setup"
-echo "  2. Start it:            herdr plugin action invoke $PLUGIN_ID.start"
-echo "  3. Show the pairing QR: herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
-echo
-echo "Then scan the QR from the Muqun app on a device on the same Tailscale network."
+if [ "$auto_done" = "1" ] && [ -z "$existing" ]; then
+  echo "The pairing QR is open in the herdr 'Gateway Manager' pane."
+  echo "Scan it from the Muqun app on a device on the same Tailscale network."
+  echo
+  echo "Re-open the QR any time with:"
+  echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
+elif [ "$auto_done" = "1" ]; then
+  echo "Re-open the pairing QR with:"
+  echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
+else
+  warn "Run these from INSIDE herdr to finish:"
+  echo "  herdr plugin action invoke $PLUGIN_ID.setup    # first time only"
+  echo "  herdr plugin action invoke $PLUGIN_ID.start"
+  echo "  herdr plugin pane open --plugin $PLUGIN_ID --entrypoint manage"
+fi

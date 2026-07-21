@@ -9,39 +9,35 @@ such as Tailscale.
 
 ## Install
 
-One command that checks your system and installs the plugin (macOS and Linux;
-Windows is not supported yet):
+One command that checks your system, installs the plugin, and on a **first
+install** also configures it, starts it, and opens the pairing QR (macOS and
+Linux; Windows is not supported yet):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
 ```
 
-It needs [Herdr](https://herdr.dev). Install downloads a prebuilt binary for
-your platform, so no Rust toolchain is required -- it is only used as a fallback
-if no release binary matches your OS/arch.
+**Run it from inside herdr** (a herdr pane/session). The gateway is a herdr
+plugin, so its setup, start, and pairing-QR steps run through herdr and need a
+live herdr session to attach to. If no session is reachable, the script still
+installs and then prints the manual commands to finish.
 
-Or install directly with Herdr's plugin installer:
+It needs [Herdr](https://herdr.dev). Install downloads a prebuilt, statically
+linked binary for your platform, so no Rust toolchain is required -- it is only
+a fallback if no release binary matches your OS/arch.
+
+If you prefer to do it by hand, install directly with Herdr's plugin installer:
 
 ```sh
 herdr plugin install BANG88/herdr-gateway
 ```
 
-Run setup once:
+then configure once, start, and open the manager panel to view the QR code,
+approve pairing requests, and start or stop the gateway:
 
 ```sh
-herdr plugin action invoke herdr.gateway.setup
-```
-
-Start the gateway:
-
-```sh
+herdr plugin action invoke herdr.gateway.setup   # first time only -- mints server id + token
 herdr plugin action invoke herdr.gateway.start
-```
-
-Open the manager panel to view the QR code, approve pairing requests, and start
-or stop the gateway:
-
-```sh
 herdr plugin pane open --plugin herdr.gateway --entrypoint manage
 ```
 
@@ -65,7 +61,12 @@ same one command:
 curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
 ```
 
-or reinstall directly:
+On a re-run the script updates the plugin and **reloads the binary for you**
+(stop + start). It does **not** re-run setup, because setup mints a fresh server
+id and token -- skipping it keeps every device you have already paired. Run it
+from inside herdr as before.
+
+Or reinstall directly (then restart it yourself, see below):
 
 ```sh
 herdr plugin install BANG88/herdr-gateway
