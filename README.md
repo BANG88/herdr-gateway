@@ -226,6 +226,9 @@ Routes:
 - `DELETE /api/devices/push-token`
 - `GET /api/sessions`
 - `GET /api/sessions/default/events`
+  (optional `?types=` filter; optional `?stream_pane=<paneId>` inlines that
+  pane's current output into its `pane.updated` events as `data.output`, so a
+  client paints on arrival with no follow-up read)
 - `GET /api/sessions/default/snapshot`
 - `GET /api/sessions/default/workspaces`
 - `POST /api/sessions/default/workspaces`
@@ -253,8 +256,11 @@ Routes:
 
 The gateway registers Muqun Expo push tokens and watches Herdr agent lifecycle
 events in the background. It sends a notification when an agent becomes
-blocked, and when an agent transitions from working to idle. Duplicate status
-events are ignored; tapping a notification opens the matching server in Muqun.
+blocked, and when an agent transitions from working to idle. The title names the
+server and the body names the agent (e.g. `Agent blocked · <server>` /
+`<agent> needs your input.`) -- only the user-set server label and agent name,
+never terminal output or prompts. Duplicate status events are ignored; tapping a
+notification opens the matching server in Muqun.
 
 ## Compatibility and API versions
 
