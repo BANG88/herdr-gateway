@@ -1308,8 +1308,12 @@ fn manage() -> anyhow::Result<()> {
                     message = String::from("no paired devices to revoke");
                 } else if let Some(device) = prompt_revoke_device(&devices)? {
                     if revoke_managed_device(&device.id)? {
-                        message = format!("revoked {}", truncate(&device.name, 36));
-                        show_qr = false;
+                        message =
+                            format!("revoked {}; scan to pair again", truncate(&device.name, 32));
+                        // Revocation usually means the user is replacing this
+                        // app's credential. Return straight to the pairing QR
+                        // instead of leaving them on the remaining device list.
+                        show_qr = true;
                     } else {
                         message = String::from("device was already revoked");
                     }
