@@ -70,6 +70,15 @@ const MAX_DEVICE_NAME_CHARS: usize = 80;
 /// interval so that routine polling does not rewrite the file on every request.
 const DEVICE_LAST_SEEN_FLUSH_MS: u128 = 5 * 60 * 1000;
 const MANAGE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+/// Herdr's general `pane.updated` subscription is intentionally coalesced and
+/// can arrive several seconds after terminal output is already readable. While
+/// a phone is actively viewing one pane, sample that pane locally and publish a
+/// frame only when its actual content changes. Herdr's revision is coalesced
+/// along with `pane.updated`, so it can remain stale even after `pane.read`
+/// already exposes new text. This keeps the mobile SSE live without polling
+/// every pane or sending unchanged terminal frames over the network.
+const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const GATEWAY_API_VERSION: &str = "1.1.0";
 const GATEWAY_API_MAJOR: u64 = 1;
 const HERDR_PROTOCOL_MIN: u64 = 16;
@@ -369,7 +378,11 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
     );
 
     let (server_id, token, token_hash) = match &existing {
-        Some(id) => (id.server_id.clone(), id.token.clone(), id.token_hash.clone()),
+        Some(id) => (
+            id.server_id.clone(),
+            id.token.clone(),
+            id.token_hash.clone(),
+        ),
         None => {
             let token = generate_token();
             let token_hash = hash_token(&token);
@@ -393,7 +406,11 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
         ),
         (None, None) => {
             let selection = auto_public_url(port);
-            (selection.url, format!("{}:{port}", selection.listen_host), selection.source)
+            (
+                selection.url,
+                format!("{}:{port}", selection.listen_host),
+                selection.source,
+            )
         }
     };
     let socket_path = socket_path
@@ -1744,9 +1761,8 @@ async fn api_set_label(
     Json(body): Json<SetLabelBody>,
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
-    let label = update_server_label(&body.label).map_err(|err| {
-        api_error(StatusCode::BAD_REQUEST, "invalid_label", &err.to_string())
-    })?;
+    let label = update_server_label(&body.label)
+        .map_err(|err| api_error(StatusCode::BAD_REQUEST, "invalid_label", &err.to_string()))?;
     Ok(Json(json!({ "label": label })))
 }
 
@@ -1871,7 +1887,58 @@ fn pane_read_text(value: &Value) -> Option<String> {
             return Some(text.to_owned());
         }
     }
-    value.pointer("/result").and_then(Value::as_str).map(str::to_owned)
+    value
+        .pointer("/result")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Convert one `pane.read` response into the same enriched `pane_updated`
+/// payload older Muqun builds already understand. The revision is kept in the
+/// payload for clients, but callers must compare the encoded frame itself:
+/// Herdr can expose new text before its coalesced revision advances.
+fn stream_pane_update_payload(value: &Value, pane_id: &str) -> Option<(u64, String)> {
+    let revision = ["/result/read/revision", "/result/revision"]
+        .into_iter()
+        .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))?;
+    let output = pane_read_text(value)?;
+    let payload = json!({
+        "event": "pane_updated",
+        "data": {
+            "pane": {
+                "pane_id": pane_id,
+                "revision": revision
+            },
+            "output": output
+        }
+    });
+    serde_json::to_string(&payload)
+        .ok()
+        .map(|encoded| (revision, encoded))
+}
+
+async fn poll_stream_pane_update(
+    session: &SessionConfig,
+    opts: &StreamOutputOpts,
+) -> Option<(u64, String)> {
+    let pane = opts.pane.as_deref()?;
+    let read = tokio::time::timeout(
+        STREAM_OUTPUT_READ_TIMEOUT,
+        herdr_request(
+            session,
+            "pane.read",
+            json!({
+                "pane_id": pane,
+                "source": opts.source,
+                "lines": opts.lines,
+                "format": opts.format,
+            }),
+        ),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    stream_pane_update_payload(&read, pane)
 }
 
 /// If `line` is a `pane.updated` for the streamed pane, read that pane's output
@@ -1888,7 +1955,11 @@ async fn enrich_pane_update(
     if normalize_event_name(value.get("event")?.as_str()?) != "pane_updated" {
         return None;
     }
-    if value.pointer("/data/pane/pane_id").and_then(Value::as_str)? != pane {
+    if value
+        .pointer("/data/pane/pane_id")
+        .and_then(Value::as_str)?
+        != pane
+    {
         return None;
     }
     // Bound the read so a slow or wedged Herdr can never stall the event loop:
@@ -1968,13 +2039,18 @@ async fn events(
     let stream = async_stream::stream! {
         match herdr_event_stream(&session).await {
             Ok(mut reader) => {
-                let mut line = String::new();
+                let mut line = Vec::new();
+                let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
+                output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_stream_payload: Option<String> = None;
                 loop {
                     line.clear();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break,
-                        Ok(_) => {
-                            let data = line.trim();
+                    tokio::select! {
+                        read = reader.read_until(b'\n', &mut line) => match read {
+                            Ok(0) => break,
+                            Ok(_) => {
+                            let data = String::from_utf8_lossy(&line);
+                            let data = data.trim();
                             if !data.is_empty() {
                                 // Filter at the point of forwarding rather than
                                 // by unsubscribing: a subscribed event a client
@@ -2001,12 +2077,21 @@ async fn events(
                                     yield Ok(Event::default().event("herdr").data(payload));
                                 }
                             }
-                        }
-                        Err(err) => {
+                            }
+                            Err(err) => {
                             eprintln!("Herdr event stream read failed: {err:#}");
                             yield Ok(Event::default().event("gateway.error").data("Herdr event stream unavailable"));
                             break;
-                        }
+                            }
+                        },
+                        _ = output_interval.tick(), if stream_opts.pane.is_some() => {
+                            if let Some((_revision, payload)) = poll_stream_pane_update(&session, &stream_opts).await {
+                                if last_stream_payload.as_deref() != Some(payload.as_str()) {
+                                    last_stream_payload = Some(payload.clone());
+                                    yield Ok(Event::default().event("herdr").data(payload));
+                                }
+                            }
+                        },
                     }
                 }
             }
@@ -4118,6 +4203,33 @@ mod tests {
     }
 
     #[test]
+    fn stream_pane_read_becomes_backward_compatible_inline_update() {
+        let read = json!({
+            "result": {
+                "read": {
+                    "pane_id": "w1:p2",
+                    "revision": 42,
+                    "text": "hello\n"
+                }
+            }
+        });
+        let (revision, encoded) = stream_pane_update_payload(&read, "w1:p2").unwrap();
+        let payload: Value = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(revision, 42);
+        assert_eq!(payload["event"], "pane_updated");
+        assert_eq!(payload["data"]["pane"]["pane_id"], "w1:p2");
+        assert_eq!(payload["data"]["pane"]["revision"], 42);
+        assert_eq!(payload["data"]["output"], "hello\n");
+    }
+
+    #[test]
+    fn stream_pane_update_requires_a_revision() {
+        let read = json!({ "result": { "read": { "text": "hello" } } });
+        assert!(stream_pane_update_payload(&read, "w1:p2").is_none());
+    }
+
+    #[test]
     fn agent_status_subscriptions_are_scoped_to_each_pane() {
         let subscriptions = event_subscriptions(&["w1:p1".into(), "w2:p3".into()]);
         let agent_subscriptions = subscriptions
@@ -4182,17 +4294,26 @@ mod tests {
             }
         });
         let mut statuses = HashMap::new();
-        let notification =
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default")
-                .unwrap();
+        let notification = notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .unwrap();
         assert_eq!(notification.title, "Agent blocked · Studio");
         assert_eq!(notification.body, "Codex needs your input.");
         assert_eq!(notification.data["type"], "agent.blocked");
         assert_eq!(notification.data["url"], "/servers/server-1");
-        assert!(
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default",)
-                .is_none()
-        );
+        assert!(notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .is_none());
     }
 
     #[test]
@@ -4206,9 +4327,14 @@ mod tests {
                 "agent_status": "idle"
             }
         });
-        let notification =
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default")
-                .unwrap();
+        let notification = notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .unwrap();
         assert_eq!(notification.title, "Agent done · Studio");
         assert_eq!(notification.body, "codex finished running.");
         assert_eq!(notification.data["type"], "agent.completed");
@@ -4222,10 +4348,14 @@ mod tests {
             "event": "pane.agent_status_changed",
             "data": { "pane_id": "w1:p2", "agent_status": "idle" }
         });
-        assert!(
-            notification_for_agent_status_event(&event, &mut statuses, "server-1", "Studio", "default",)
-                .is_none()
-        );
+        assert!(notification_for_agent_status_event(
+            &event,
+            &mut statuses,
+            "server-1",
+            "Studio",
+            "default",
+        )
+        .is_none());
         assert_eq!(statuses.get("w1:p2").map(String::as_str), Some("idle"));
     }
 
