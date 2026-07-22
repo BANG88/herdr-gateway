@@ -1,6 +1,6 @@
 id = "herdr.gateway"
 name = "Herdr Gateway"
-version = "0.4.0"
+version = "0.4.1"
 min_herdr_version = "0.7.5"
 description = "Expose a token-protected mobile gateway API for Herdr."
 platforms = ["linux", "macos"]
@@ -38,8 +38,8 @@ command = ["./target/release/herdr-gateway", "status"]
 id = "manage"
 title = "Gateway Manager"
 placement = "popup"
-width = 78
-height = 48
+width = 92
+height = 34
 command = ["./target/release/herdr-gateway", "manage"]
 
 [[panes]]

@@ -448,20 +448,14 @@ fn setup(public_url: Option<String>, port: u16, socket_path: Option<String>) -> 
             payload: payload.clone(),
         })?,
     )?;
-    let encoded = pairing_qr_payload(&payload)?;
-    let code = QrCode::with_error_correction_level(encoded.as_bytes(), EcLevel::L)?;
-    let image = render_qr(&code);
-
     println!("wrote config: {}", path.display());
     println!("wrote pairing file: {}", pairing_path.display());
     println!("public URL: {} ({url_source})", payload.url);
     if payload.url.contains("127.0.0.1") || payload.url.contains("localhost") {
         println!("warning: pairing URL is local-only; rerun setup after starting Tailscale or pass --public-url");
     }
-    println!("pairing payload:");
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    println!("scan this QR code from the mobile app:");
-    println!("{image}");
+    println!("pairing identity is ready");
+    println!("open the Gateway Manager pane to scan the QR code");
     Ok(())
 }
 
@@ -1309,6 +1303,20 @@ fn manage() -> anyhow::Result<()> {
                 show_qr = true;
                 message = String::from("scan to pair another device");
             }
+            "x" | "revoke" => {
+                if devices.is_empty() {
+                    message = String::from("no paired devices to revoke");
+                } else if let Some(device) = prompt_revoke_device(&devices)? {
+                    if revoke_managed_device(&device.id)? {
+                        message = format!("revoked {}", truncate(&device.name, 36));
+                        show_qr = false;
+                    } else {
+                        message = String::from("device was already revoked");
+                    }
+                } else {
+                    message = String::from("revoke cancelled");
+                }
+            }
             "r" | "refresh" | "" => {
                 show_qr = false;
                 message = String::from("refreshed");
@@ -1374,13 +1382,92 @@ fn render_public_url_prompt(value: &str) -> anyhow::Result<()> {
         String::from(""),
         String::from("Edit the URL encoded into the pairing QR."),
         String::from("Use a Tailscale HTTPS name if Tailscale Serve is configured."),
-        String::from("Otherwise use http://<tailscale-ip>:23100."),
+        format!("Otherwise use http://<tailscale-ip>:{DEFAULT_PORT}."),
         String::from(""),
         format!("url: {value}"),
         String::from(""),
         String::from("Enter saves | Esc cancels | Backspace deletes"),
     ];
-    write_centered_box(&lines)
+    write_centered_panel(&lines)
+}
+
+fn prompt_revoke_device(devices: &[DeviceRecord]) -> anyhow::Result<Option<DeviceRecord>> {
+    let choices = devices.iter().rev().cloned().collect::<Vec<_>>();
+    if choices.is_empty() {
+        return Ok(None);
+    }
+    let mut selected = 0_usize;
+
+    loop {
+        render_revoke_device_picker(&choices, selected)?;
+        let TerminalEvent::Key(event) = read_event()? else {
+            continue;
+        };
+        if event.kind != KeyEventKind::Press {
+            continue;
+        }
+        match event.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(choices.len() - 1);
+            }
+            KeyCode::Enter => {
+                let device = &choices[selected];
+                if confirm_revoke_device(device)? {
+                    return Ok(Some(device.clone()));
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
+fn render_revoke_device_picker(devices: &[DeviceRecord], selected: usize) -> anyhow::Result<()> {
+    execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+    let mut lines = vec![
+        String::from("Revoke a paired device"),
+        String::from(""),
+        String::from("Up/Down or j/k selects | Enter continues | Esc cancels"),
+        String::from(""),
+    ];
+    for (index, device) in devices.iter().enumerate() {
+        lines.push(format!(
+            "{} {}   paired {}",
+            if index == selected { ">" } else { " " },
+            truncate(&device.name, 42),
+            relative_since(device.paired_unix_ms)
+        ));
+    }
+    write_centered_panel(&lines)
+}
+
+fn confirm_revoke_device(device: &DeviceRecord) -> anyhow::Result<bool> {
+    loop {
+        execute!(stdout(), Clear(ClearType::All), MoveTo(0, 0))?;
+        let lines = vec![
+            String::from("Revoke device?"),
+            String::from(""),
+            truncate(&device.name, 52),
+            String::from("Its access token will stop working immediately."),
+            String::from(""),
+            String::from("y revoke | n or Esc cancel"),
+        ];
+        write_centered_panel(&lines)?;
+        let TerminalEvent::Key(event) = read_event()? else {
+            continue;
+        };
+        if event.kind != KeyEventKind::Press {
+            continue;
+        }
+        match event.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
+            _ => {}
+        }
+    }
 }
 
 fn update_public_url(public_url: &str) -> anyhow::Result<()> {
@@ -1468,7 +1555,8 @@ fn print_manage_screen(
     let mut lines = vec![
         String::from("Herdr Gateway for Muqun"),
         String::from(""),
-        String::from("keys   : s start | t stop | u url | a auto | p pair | r refresh | q quit"),
+        String::from("keys   : [s] start  [t] stop  [p] pair  [x] revoke"),
+        String::from("         [u] url    [a] auto  [r] refresh  [q] close"),
         format!("server : {server}"),
         format!("url    : {url}"),
         format!("status : {status}"),
@@ -1485,7 +1573,7 @@ fn print_manage_screen(
             String::from(""),
             String::from("Enter this code in Muqun to finish pairing."),
         ]);
-        write_centered_box(&lines)?;
+        write_centered_panel(&lines)?;
         return Ok(());
     }
 
@@ -1505,28 +1593,55 @@ fn print_manage_screen(
             ));
         }
         lines.push(String::from(""));
-        lines.push(String::from("Press p to pair another device."));
-        write_centered_box(&lines)?;
+        lines.push(String::from(
+            "Press p to pair another device, or x to revoke one.",
+        ));
+        write_centered_panel(&lines)?;
         return Ok(());
     }
 
-    if let Ok(pairing) = read_pairing_file() {
-        let payload = pairing.payload;
-        lines.extend([
-            String::from("Scan with Muqun app"),
-            String::from("Confirmation code appears after scan."),
+    if let (Some(config), Ok(pairing)) = (config.as_ref(), read_pairing_file()) {
+        if hash_token(&pairing.payload.token) != config.token_hash {
+            lines.push(String::from("Pairing identity is stale. Run setup again."));
+            write_centered_panel(&lines)?;
+            return Ok(());
+        }
+        let qr_controls = vec![
+            String::from("Muqun Gateway"),
             String::from(""),
-        ]);
-        let encoded = pairing_qr_payload(&payload)?;
+            String::from("[s] start   [t] stop"),
+            String::from("[p] pair    [x] revoke"),
+            String::from("[u] URL     [a] auto URL"),
+            String::from("[r] devices / refresh"),
+            String::from("[q/Esc] close"),
+            String::from(""),
+            format!("server: {}", truncate(&server, 18)),
+            format!("url: {}", truncate(&url, 21)),
+            format!("status: {}", truncate(&status, 18)),
+            format!("message: {}", truncate(message, 17)),
+        ];
+        let mut qr_lines = vec![
+            String::from("Scan with Muqun"),
+            String::from("Code appears after scan"),
+            String::from(""),
+        ];
+        // Config is authoritative for the advertised URL and server id. Older
+        // pairing files can retain a stale URL even though their admin token is
+        // still valid; rendering from that file made `p` show the wrong server.
+        let encoded = pairing_qr_offer(&config.public_url, &config.server_id);
         let code = QrCode::with_error_correction_level(encoded.as_bytes(), EcLevel::L)?;
         let image = render_qr(&code);
         for line in image.lines() {
-            lines.push(line.to_string());
+            qr_lines.push(line.to_string());
         }
+        write_two_column_panel(&qr_controls, &qr_lines)?;
+        return Ok(());
     } else {
-        lines.push(String::from("No pairing file. Run setup first."));
+        lines.push(String::from(
+            "Gateway pairing is not configured. Run setup first.",
+        ));
     }
-    write_centered_box(&lines)?;
+    write_centered_panel(&lines)?;
     Ok(())
 }
 
@@ -1555,7 +1670,7 @@ fn push_line(output: &mut String, line: impl AsRef<str>) {
     output.push_str("\r\n");
 }
 
-fn write_centered_box(lines: &[String]) -> anyhow::Result<()> {
+fn write_centered_panel(lines: &[String]) -> anyhow::Result<()> {
     let terminal_width = terminal_size()
         .map(|(width, _)| width as usize)
         .unwrap_or(110);
@@ -1564,49 +1679,103 @@ fn write_centered_box(lines: &[String]) -> anyhow::Result<()> {
         .map(|line| display_width(line))
         .max()
         .unwrap_or(0)
-        .max(56);
-    let box_width = content_width + 4;
-    let indent = terminal_width.saturating_sub(box_width) / 2;
-    let prefix = " ".repeat(indent);
+        .max(56)
+        .min(terminal_width.saturating_sub(4));
+    let indent = terminal_width.saturating_sub(content_width) / 2;
+    // Popup interiors can be a few rows shorter than the child PTY reports.
+    // Keep content anchored at the top so a long QR never scrolls the controls
+    // out of view on smaller laptop terminals.
     let mut output = String::new();
 
-    push_line(&mut output, "");
-    push_line(
-        &mut output,
-        format!("{prefix}+{}+", "-".repeat(box_width - 2)),
-    );
     for line in lines {
         let line_width = display_width(line);
-        let left_padding = if line.is_empty() {
-            1
-        } else if !line.contains(':') {
-            (content_width.saturating_sub(line_width) / 2) + 1
+        let left_padding = if line.contains(':') || line.starts_with("> ") || line.starts_with("  ")
+        {
+            0
         } else {
-            1
+            content_width.saturating_sub(line_width) / 2
         };
-        let right_padding = box_width - 2 - left_padding - line_width;
         push_line(
             &mut output,
-            format!(
-                "{prefix}|{}{}{}|",
-                " ".repeat(left_padding),
-                line,
-                " ".repeat(right_padding)
-            ),
+            format!("{}{}{}", " ".repeat(indent + left_padding), line, "\x1b[0m"),
         );
     }
-    push_line(
-        &mut output,
-        format!("{prefix}+{}+", "-".repeat(box_width - 2)),
-    );
 
     stdout().write_all(output.as_bytes())?;
     stdout().flush()?;
     Ok(())
 }
 
+fn write_two_column_panel(left: &[String], right: &[String]) -> anyhow::Result<()> {
+    let terminal_width = terminal_size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(92);
+    let left_width = left
+        .iter()
+        .map(|line| display_width(line))
+        .max()
+        .unwrap_or(0);
+    let right_width = right
+        .iter()
+        .map(|line| display_width(line))
+        .max()
+        .unwrap_or(0);
+    let gap = if left_width + right_width + 4 <= terminal_width {
+        4
+    } else {
+        1
+    };
+    let total_width = left_width + gap + right_width;
+
+    // Extremely narrow terminals cannot preserve QR geometry beside controls.
+    // Keep the controls visible first, then render the code below as a fallback.
+    if total_width > terminal_width {
+        let mut stacked = left.to_vec();
+        stacked.push(String::new());
+        stacked.extend_from_slice(right);
+        return write_centered_panel(&stacked);
+    }
+
+    let indent = terminal_width.saturating_sub(total_width) / 2;
+    let row_count = left.len().max(right.len());
+    let mut output = String::new();
+    for row in 0..row_count {
+        let left_line = left.get(row).map(String::as_str).unwrap_or("");
+        let right_line = right.get(row).map(String::as_str).unwrap_or("");
+        let left_padding = left_width.saturating_sub(display_width(left_line));
+        push_line(
+            &mut output,
+            format!(
+                "{}{}{}{}{}\x1b[0m",
+                " ".repeat(indent),
+                left_line,
+                " ".repeat(left_padding),
+                " ".repeat(gap),
+                right_line
+            ),
+        );
+    }
+    stdout().write_all(output.as_bytes())?;
+    stdout().flush()?;
+    Ok(())
+}
+
 fn display_width(value: &str) -> usize {
-    value.chars().count()
+    let mut chars = value.chars().peekable();
+    let mut width = 0;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for control in chars.by_ref() {
+                if ('@'..='~').contains(&control) {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -1673,6 +1842,47 @@ fn fetch_pending_pairing() -> anyhow::Result<Option<PendingPairing>> {
     }))
 }
 
+fn revoke_managed_device(device_id: &str) -> anyhow::Result<bool> {
+    let pairing = read_pairing_file()?;
+    let config = load_config(None)?;
+    let listen: SocketAddr = config
+        .listen
+        .parse()
+        .with_context(|| format!("invalid listen address {}", config.listen))?;
+    let address = local_management_addr(listen);
+    let mut stream = match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1)) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            // With no running gateway there is no in-memory token list to
+            // invalidate, so updating the persisted records is sufficient.
+            return revoke_device_by_id(device_id);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let request = format!(
+        "DELETE /api/pairings/{device_id} HTTP/1.1\r\nHost: {address}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+        pairing.payload.token
+    );
+    std::io::Write::write_all(&mut stream, request.as_bytes())?;
+    let mut response = String::new();
+    std::io::Read::read_to_string(&mut stream, &mut response)?;
+    let status_line = response.lines().next().unwrap_or_default();
+    if status_line.contains(" 200 ") {
+        return Ok(true);
+    }
+    if status_line.contains(" 404 ") {
+        return Ok(false);
+    }
+    anyhow::bail!("gateway refused device revocation: {status_line}")
+}
+
 fn local_management_addr(listen: SocketAddr) -> SocketAddr {
     if listen.ip().is_unspecified() {
         if listen.is_ipv6() {
@@ -1704,12 +1914,12 @@ fn validate_public_url(value: &str) -> anyhow::Result<String> {
     Ok(value.trim_end_matches('/').to_string())
 }
 
-fn pairing_qr_payload(payload: &PairingPayload) -> anyhow::Result<String> {
-    Ok(format!(
+fn pairing_qr_offer(url: &str, server_id: &str) -> String {
+    format!(
         "muqun://pair?u={}&s={}",
-        url_component(&payload.url),
-        url_component(&payload.server_id)
-    ))
+        url_component(url),
+        url_component(server_id)
+    )
 }
 
 fn url_component(value: &str) -> String {
@@ -1726,11 +1936,15 @@ fn url_component(value: &str) -> String {
 }
 
 fn render_qr(code: &QrCode) -> String {
-    code.render::<unicode::Dense1x2>()
-        .dark_color(unicode::Dense1x2::Light)
-        .light_color(unicode::Dense1x2::Dark)
-        .quiet_zone(true)
-        .build()
+    let image = code.render::<unicode::Dense1x2>().quiet_zone(true).build();
+    // Force the standard dark-on-light polarity. Relying on the terminal's
+    // foreground/background colors can invert the code under some Herdr themes
+    // and native camera scanners do not consistently recover from that.
+    image
+        .lines()
+        .map(|line| format!("\x1b[30;47m{line}\x1b[0m"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Value>> {
@@ -3027,6 +3241,13 @@ fn require_admin(config: &Config, headers: &HeaderMap) -> ApiResult<()> {
     Ok(())
 }
 
+fn require_pairing_manager(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if require_admin(&state.config, headers).is_ok() {
+        return Ok(());
+    }
+    require_device(state, headers).map(|_| ())
+}
+
 fn lock_devices(state: &AppState) -> ApiResult<std::sync::MutexGuard<'_, Vec<DeviceRecord>>> {
     state.devices.lock().map_err(|_| {
         api_error(
@@ -3063,7 +3284,10 @@ async fn revoke_paired_device(
     Path(device_id): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<Json<Value>> {
-    require_device(&state, &headers)?;
+    // Paired devices can manage pairings through the app; the local Manager
+    // pane uses its admin token for the same narrow operation. The admin token
+    // still cannot access terminal/workspace control routes.
+    require_pairing_manager(&state, &headers)?;
     let mut devices = lock_devices(&state)?;
     let previous_len = devices.len();
     devices.retain(|device| device.id != device_id);
@@ -3266,8 +3490,8 @@ fn list_devices() -> anyhow::Result<()> {
 }
 
 fn revoke_device(device_id: Option<String>, all: bool) -> anyhow::Result<()> {
-    let mut devices = read_devices()?;
     if all {
+        let mut devices = read_devices()?;
         let count = devices.len();
         devices.clear();
         write_devices(&devices)?;
@@ -3277,14 +3501,22 @@ fn revoke_device(device_id: Option<String>, all: bool) -> anyhow::Result<()> {
     let Some(device_id) = device_id else {
         anyhow::bail!("pass a device id from `gateway devices`, or --all");
     };
+    if !revoke_device_by_id(&device_id)? {
+        anyhow::bail!("device {device_id} not found");
+    }
+    println!("revoked device {device_id}");
+    Ok(())
+}
+
+fn revoke_device_by_id(device_id: &str) -> anyhow::Result<bool> {
+    let mut devices = read_devices()?;
     let previous_len = devices.len();
     devices.retain(|device| device.id != device_id);
     if devices.len() == previous_len {
-        anyhow::bail!("device {device_id} not found");
+        return Ok(false);
     }
     write_devices(&devices)?;
-    println!("revoked device {device_id}");
-    Ok(())
+    Ok(true)
 }
 
 fn format_unix_ms(value: u128) -> String {
@@ -4012,6 +4244,15 @@ mod tests {
     }
 
     #[test]
+    fn pairing_revocation_accepts_manager_or_device_but_control_stays_device_only() {
+        let state = test_state("admin-token", vec![test_device("device-1", "device-token")]);
+        assert!(require_pairing_manager(&state, &bearer_headers("admin-token")).is_ok());
+        assert!(require_pairing_manager(&state, &bearer_headers("device-token")).is_ok());
+        assert!(require_pairing_manager(&state, &bearer_headers("wrong")).is_err());
+        assert!(require_device(&state, &bearer_headers("admin-token")).is_err());
+    }
+
+    #[test]
     fn auth_rejects_invalid_bearer_token() {
         let state = test_state("secret", vec![test_device("device-1", "device-token")]);
         let err = require_device(&state, &bearer_headers("wrong")).unwrap_err();
@@ -4295,6 +4536,32 @@ mod tests {
         assert_eq!(value["kind"], "herdr-gateway");
         assert_eq!(value["url"], "http://100.1.2.3:23100");
         assert_eq!(value["token"], "secret");
+    }
+
+    #[test]
+    fn manager_qr_uses_the_current_config_fields() {
+        assert_eq!(
+            pairing_qr_offer("http://100.1.2.3:23847", "server-1"),
+            "muqun://pair?u=http%3A%2F%2F100.1.2.3%3A23847&s=server-1"
+        );
+    }
+
+    #[test]
+    fn terminal_qr_has_explicit_standard_colors_and_measurable_width() {
+        let code = QrCode::with_error_correction_level(
+            b"muqun://pair?u=http%3A%2F%2Fhost&s=id",
+            EcLevel::L,
+        )
+        .unwrap();
+        let image = render_qr(&code);
+        let expected_width = code.width() + 8;
+        assert!(image
+            .lines()
+            .all(|line| line.starts_with("\x1b[30;47m") && line.ends_with("\x1b[0m")));
+        assert!(image
+            .lines()
+            .all(|line| display_width(line) == expected_width));
+        assert_eq!(display_width("\x1b[30;47m█▀ \x1b[0m"), 3);
     }
 
     #[test]

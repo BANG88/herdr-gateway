@@ -47,7 +47,8 @@ herdr plugin pane open --plugin herdr.gateway --entrypoint manage
 In the manager panel, press `u` to edit the public gateway URL. Press `a` to
 auto-detect it again. Saving the URL updates both the gateway config and the
 pairing QR code. Once a device is paired, the panel shows the paired-device list
-instead of the QR; press `p` to bring the QR back and pair another device.
+instead of the QR; press `p` to bring the QR back and pair another device. Press
+`x` to select and revoke a paired device; its token is invalidated immediately.
 
 Stop the gateway:
 
@@ -181,9 +182,9 @@ There are two kinds of credential, and they are not interchangeable:
 - **Device tokens** are the only thing that authorises a control route. They
   exist on the paired device and are stored hashed on the server.
 - **The admin token** in `pairing.json` belongs to the local manager panel and
-  authorises exactly one route, `GET /api/pair/pending`. It is never handed out
-  to a device. Because it sits in plaintext on disk, it deliberately cannot
-  reach the routes that run commands on the host.
+  authorises only pending-pairing reads and device revocation. It is never
+  handed out to a device. Because it sits in plaintext on disk, it deliberately
+  cannot reach the routes that run commands on the host.
 
 ```sh
 herdr-gateway devices             # list paired devices and when each was last seen
@@ -268,7 +269,7 @@ notification opens the matching server in Muqun.
 
 ## Compatibility and API versions
 
-Herdr Gateway 0.4.0 requires Herdr 0.7.5 or newer and socket protocol 17.
+Herdr Gateway 0.4.1 requires Herdr 0.7.5 or newer and socket protocol 17.
 Earlier Herdr releases are intentionally unsupported; update Herdr and restart
 the running session before starting this Gateway release.
 
