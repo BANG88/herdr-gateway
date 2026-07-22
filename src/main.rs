@@ -1876,6 +1876,11 @@ struct StreamOutputOpts {
     format: String,
 }
 
+struct StreamPaneFrame {
+    revision: u64,
+    output: String,
+}
+
 /// Pulls the terminal text out of a Herdr `pane.read` response, tolerating both
 /// the bare-string and `{ text: ... }` result shapes across Herdr versions.
 fn pane_read_text(value: &Value) -> Option<String> {
@@ -1893,34 +1898,35 @@ fn pane_read_text(value: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Convert one `pane.read` response into the same enriched `pane_updated`
-/// payload older Muqun builds already understand. The revision is kept in the
-/// payload for clients, but callers must compare the encoded frame itself:
-/// Herdr can expose new text before its coalesced revision advances.
-fn stream_pane_update_payload(value: &Value, pane_id: &str) -> Option<(u64, String)> {
+fn stream_pane_frame(value: &Value) -> Option<StreamPaneFrame> {
     let revision = ["/result/read/revision", "/result/revision"]
         .into_iter()
         .find_map(|pointer| value.pointer(pointer).and_then(Value::as_u64))?;
     let output = pane_read_text(value)?;
+    Some(StreamPaneFrame { revision, output })
+}
+
+/// Convert one sampled frame into the enriched `pane_updated` payload consumed
+/// by Muqun. Output content, rather than revision, is used to decide whether to
+/// emit because Herdr can expose new text before its coalesced revision advances.
+fn stream_pane_update_payload(frame: &StreamPaneFrame, pane_id: &str) -> Option<String> {
     let payload = json!({
         "event": "pane_updated",
         "data": {
             "pane": {
                 "pane_id": pane_id,
-                "revision": revision
+                "revision": frame.revision
             },
-            "output": output
+            "output": frame.output
         }
     });
-    serde_json::to_string(&payload)
-        .ok()
-        .map(|encoded| (revision, encoded))
+    serde_json::to_string(&payload).ok()
 }
 
 async fn poll_stream_pane_update(
     session: &SessionConfig,
     opts: &StreamOutputOpts,
-) -> Option<(u64, String)> {
+) -> Option<StreamPaneFrame> {
     let pane = opts.pane.as_deref()?;
     let read = tokio::time::timeout(
         STREAM_OUTPUT_READ_TIMEOUT,
@@ -1938,7 +1944,7 @@ async fn poll_stream_pane_update(
     .await
     .ok()?
     .ok()?;
-    stream_pane_update_payload(&read, pane)
+    stream_pane_frame(&read)
 }
 
 /// If `line` is a `pane.updated` for the streamed pane, read that pane's output
@@ -2042,7 +2048,7 @@ async fn events(
                 let mut line = Vec::new();
                 let mut output_interval = tokio::time::interval(STREAM_OUTPUT_POLL_INTERVAL);
                 output_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut last_stream_payload: Option<String> = None;
+                let mut last_stream_output: Option<String> = None;
                 loop {
                     line.clear();
                     tokio::select! {
@@ -2085,10 +2091,14 @@ async fn events(
                             }
                         },
                         _ = output_interval.tick(), if stream_opts.pane.is_some() => {
-                            if let Some((_revision, payload)) = poll_stream_pane_update(&session, &stream_opts).await {
-                                if last_stream_payload.as_deref() != Some(payload.as_str()) {
-                                    last_stream_payload = Some(payload.clone());
-                                    yield Ok(Event::default().event("herdr").data(payload));
+                            if let Some(frame) = poll_stream_pane_update(&session, &stream_opts).await {
+                                if last_stream_output.as_deref() != Some(frame.output.as_str()) {
+                                    last_stream_output = Some(frame.output.clone());
+                                    if let Some(pane_id) = stream_opts.pane.as_deref() {
+                                        if let Some(payload) = stream_pane_update_payload(&frame, pane_id) {
+                                            yield Ok(Event::default().event("herdr").data(payload));
+                                        }
+                                    }
                                 }
                             }
                         },
@@ -4203,7 +4213,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_pane_read_becomes_backward_compatible_inline_update() {
+    fn stream_pane_read_becomes_inline_update() {
         let read = json!({
             "result": {
                 "read": {
@@ -4213,20 +4223,22 @@ mod tests {
                 }
             }
         });
-        let (revision, encoded) = stream_pane_update_payload(&read, "w1:p2").unwrap();
+        let frame = stream_pane_frame(&read).unwrap();
+        let encoded = stream_pane_update_payload(&frame, "w1:p2").unwrap();
         let payload: Value = serde_json::from_str(&encoded).unwrap();
 
-        assert_eq!(revision, 42);
+        assert_eq!(frame.revision, 42);
         assert_eq!(payload["event"], "pane_updated");
         assert_eq!(payload["data"]["pane"]["pane_id"], "w1:p2");
         assert_eq!(payload["data"]["pane"]["revision"], 42);
+        assert!(payload["data"]["pane"].get("source_revision").is_none());
         assert_eq!(payload["data"]["output"], "hello\n");
     }
 
     #[test]
     fn stream_pane_update_requires_a_revision() {
         let read = json!({ "result": { "read": { "text": "hello" } } });
-        assert!(stream_pane_update_payload(&read, "w1:p2").is_none());
+        assert!(stream_pane_frame(&read).is_none());
     }
 
     #[test]
