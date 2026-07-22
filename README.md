@@ -17,10 +17,10 @@ Linux; Windows is not supported yet):
 curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
 ```
 
-**Run it from inside herdr** (a herdr pane/session). The gateway is a herdr
-plugin, so its setup, start, and pairing-QR steps run through herdr and need a
-live herdr session to attach to. If no session is reachable, the script still
-installs and then prints the manual commands to finish.
+Herdr 0.7.5 installs plugins globally for the current user, so the plugin can be
+installed from any shell. Its setup, start, and pairing-QR actions still need a
+live herdr session; if none is reachable, the script installs the plugin and
+prints the manual commands to finish.
 
 It needs [Herdr](https://herdr.dev). Install downloads a prebuilt, statically
 linked binary for your platform, so no Rust toolchain is required -- it is only
@@ -64,8 +64,9 @@ curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.s
 
 On a re-run the script updates the plugin and **reloads the binary for you**
 (stop + start). It does **not** re-run setup, because setup mints a fresh server
-id and token -- skipping it keeps every device you have already paired. Run it
-from inside herdr as before.
+id and token -- skipping it keeps every device you have already paired.
+Installation may run from any shell; keep a herdr session running so the reload
+actions can attach.
 
 Or reinstall directly (then restart it yourself, see below):
 
@@ -263,6 +264,10 @@ never terminal output or prompts. Duplicate status events are ignored; tapping a
 notification opens the matching server in Muqun.
 
 ## Compatibility and API versions
+
+Herdr Gateway 0.4.0 requires Herdr 0.7.5 or newer and socket protocol 17.
+Earlier Herdr releases are intentionally unsupported; update Herdr and restart
+the running session before starting this Gateway release.
 
 The Gateway API has its own Semantic Version (`apiVersion`), independent from
 the Gateway binary version and the installed Herdr version. `/health` and the

@@ -1,7 +1,7 @@
 id = "herdr.gateway"
 name = "Herdr Gateway"
-version = "0.3.9"
-min_herdr_version = "0.7.0"
+version = "0.4.0"
+min_herdr_version = "0.7.5"
 description = "Expose a token-protected mobile gateway API for Herdr."
 platforms = ["linux", "macos"]
 

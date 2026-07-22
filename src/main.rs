@@ -81,8 +81,8 @@ const STREAM_OUTPUT_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const STREAM_OUTPUT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 const GATEWAY_API_VERSION: &str = "1.1.0";
 const GATEWAY_API_MAJOR: u64 = 1;
-const HERDR_PROTOCOL_MIN: u64 = 16;
-const HERDR_PROTOCOL_MAX: u64 = 16;
+const HERDR_PROTOCOL_MIN: u64 = 17;
+const HERDR_PROTOCOL_MAX: u64 = 17;
 const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024;
 const API_CAPABILITIES: &[&str] = &[
     "agent_lifecycle_notifications",
@@ -1360,11 +1360,7 @@ fn prompt_public_url() -> anyhow::Result<Option<String>> {
                 KeyCode::Backspace => {
                     value.pop();
                 }
-                KeyCode::Char(ch) => {
-                    if !ch.is_control() {
-                        value.push(ch);
-                    }
-                }
+                KeyCode::Char(ch) if !ch.is_control() => value.push(ch),
                 _ => {}
             }
         }
@@ -2526,20 +2522,56 @@ async fn split_pane(
             "direction must be right or down",
         ));
     }
+    let command = body
+        .command
+        .map(|parts| parts.join(" "))
+        .filter(|text| !text.trim().is_empty());
+    if let Some(text) = command.as_deref() {
+        validate_text(text)?;
+    }
     let mut params = serde_json::Map::new();
-    params.insert("pane_id".into(), json!(pane_id));
+    params.insert("target_pane_id".into(), json!(pane_id));
     params.insert("direction".into(), json!(body.direction));
     insert_opt(&mut params, "ratio", body.ratio);
-    insert_opt(&mut params, "command", body.command);
     insert_opt(&mut params, "cwd", body.cwd);
     insert_opt(&mut params, "env", body.env);
-    call_session_method(
+    let result = call_session_method(
         &state.config,
         &session_id,
         "pane.split",
         Value::Object(params),
     )
-    .await
+    .await?;
+    if let Some(text) = command {
+        let created_pane_id = created_pane_id(&result).ok_or_else(|| {
+            api_error(
+                StatusCode::BAD_GATEWAY,
+                "invalid_split_response",
+                "Herdr did not return the created pane id",
+            )
+        })?;
+        let _ = call_session_method(
+            &state.config,
+            &session_id,
+            "pane.send_text",
+            json!({ "pane_id": created_pane_id, "text": text }),
+        )
+        .await?;
+        let _ = call_session_method(
+            &state.config,
+            &session_id,
+            "pane.send_keys",
+            json!({ "pane_id": created_pane_id, "keys": ["Enter"] }),
+        )
+        .await?;
+    }
+    Ok(result)
+}
+
+fn created_pane_id(value: &Value) -> Option<&str> {
+    value
+        .pointer("/result/pane/pane_id")
+        .and_then(Value::as_str)
 }
 
 async fn zoom_pane(
@@ -2604,46 +2636,13 @@ async fn send_agent(
 ) -> ApiResult<Json<Value>> {
     require_device(&state, &headers)?;
     validate_text(&body.text)?;
-    let Json(agent) = call_session_method(
+    call_session_method(
         &state.config,
         &session_id,
-        "agent.get",
-        json!({ "target": target.clone() }),
-    )
-    .await?;
-    let pane_id = agent_pane_id(&agent)
-        .ok_or_else(|| {
-            api_error(
-                StatusCode::BAD_GATEWAY,
-                "invalid_agent_response",
-                "Herdr did not return the agent pane id",
-            )
-        })?
-        .to_owned();
-    let result = call_session_method(
-        &state.config,
-        &session_id,
-        "agent.send",
+        "agent.prompt",
         json!({ "target": target, "text": body.text }),
     )
-    .await?;
-    // Give terminal paste handling time to finish before the submit key arrives.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let _ = call_session_method(
-        &state.config,
-        &session_id,
-        "pane.send_keys",
-        json!({ "pane_id": pane_id, "keys": ["Enter"] }),
-    )
-    .await?;
-    Ok(result)
-}
-
-fn agent_pane_id(value: &Value) -> Option<&str> {
-    value
-        .pointer("/result/agent/pane_id")
-        .or_else(|| value.pointer("/result/pane_id"))
-        .and_then(Value::as_str)
+    .await
 }
 
 async fn pane_output(
@@ -2820,7 +2819,7 @@ async fn herdr_request(
         let mut response = String::new();
         reader.read_line(&mut response).await?;
         let value = serde_json::from_str(&response)?;
-        return Ok(value);
+        Ok(value)
     }
 
     #[cfg(not(unix))]
@@ -3453,7 +3452,7 @@ fn write_secret_file(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()>
         // older build keeps its old permissions until they are set explicitly.
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
         std::io::Write::write_all(&mut file, bytes)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -4267,15 +4266,20 @@ mod tests {
     }
 
     #[test]
-    fn agent_pane_id_supports_agent_get_response() {
+    fn herdr_compatibility_requires_protocol_17() {
+        assert_eq!(HERDR_PROTOCOL_MIN, 17);
+        assert_eq!(HERDR_PROTOCOL_MAX, 17);
+    }
+
+    #[test]
+    fn split_result_uses_protocol_17_pane_shape() {
         let response = json!({
             "result": {
-                "agent": {
-                    "pane_id": "w1:p2"
-                }
+                "type": "pane_created",
+                "pane": { "pane_id": "w1:p2" }
             }
         });
-        assert_eq!(agent_pane_id(&response), Some("w1:p2"));
+        assert_eq!(created_pane_id(&response), Some("w1:p2"));
     }
 
     #[test]

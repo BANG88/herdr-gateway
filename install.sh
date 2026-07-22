@@ -3,8 +3,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
 #
-# Run this from INSIDE herdr (a herdr pane/session). The gateway lives as a
-# herdr plugin, so setup/start and the pairing QR are driven through herdr and
+# Herdr 0.7.5 installs plugins globally, so installation may run from any shell.
+# Setup/start and the pairing QR are driven through plugin actions and still
 # need a running herdr session to attach to.
 #
 # On a first install it also configures, starts, and opens the pairing QR for
