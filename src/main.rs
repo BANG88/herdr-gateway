@@ -514,10 +514,26 @@ fn auto_public_url(port: u16) -> PublicUrlSelection {
                 .find(|ip| ip.contains('.'))
         })
     {
-        return PublicUrlSelection {
-            url: format!("http://{ip}:{port}"),
-            source: String::from("tailscale ip"),
-            listen_host: ip.to_string(),
+        // Prefer the MagicDNS name in the URL over the raw IP: it's stable across
+        // IP changes and is the name the user gets HTTPS on the moment they point
+        // Tailscale Serve at the gateway. The listener still binds to the IP, and
+        // MagicDNS resolves the name to it, so the phone reaches it either way.
+        let magic_dns = status
+            .pointer("/Self/DNSName")
+            .and_then(Value::as_str)
+            .map(|name| name.trim_end_matches('.'))
+            .filter(|name| !name.is_empty());
+        return match magic_dns {
+            Some(name) => PublicUrlSelection {
+                url: format!("http://{name}:{port}"),
+                source: String::from("tailscale magicdns (http; set up Serve for https)"),
+                listen_host: ip.to_string(),
+            },
+            None => PublicUrlSelection {
+                url: format!("http://{ip}:{port}"),
+                source: String::from("tailscale ip"),
+                listen_host: ip.to_string(),
+            },
         };
     }
 
@@ -709,7 +725,7 @@ async fn run(config_path: Option<String>) -> anyhow::Result<()> {
         .route("/api/pair/request", post(pair_request))
         .route("/api/pair/claim", post(pair_claim))
         .route("/api/pair/pending", get(pair_pending))
-        .route("/api/meta", get(api_meta))
+        .route("/api/meta", get(api_meta).patch(api_set_label))
         .route("/api/pairings", get(list_paired_devices))
         .route(
             "/api/pairings/{device_id}",
@@ -1714,6 +1730,26 @@ async fn api_meta(State(state): State<AppState>, headers: HeaderMap) -> ApiResul
     Ok(Json(gateway_metadata(&state).await?))
 }
 
+#[derive(Deserialize)]
+struct SetLabelBody {
+    label: String,
+}
+
+/// Set the server's display label from a paired device -- the app calls this
+/// when the user renames the server, so push notifications carry that name
+/// instead of the hostname default.
+async fn api_set_label(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetLabelBody>,
+) -> ApiResult<Json<Value>> {
+    require_device(&state, &headers)?;
+    let label = update_server_label(&body.label).map_err(|err| {
+        api_error(StatusCode::BAD_REQUEST, "invalid_label", &err.to_string())
+    })?;
+    Ok(Json(json!({ "label": label })))
+}
+
 async fn gateway_metadata(state: &AppState) -> ApiResult<Value> {
     let session = find_session(&state.config, "default")?;
     let herdr = match herdr_request(session, "ping", json!({})).await {
@@ -2000,7 +2036,7 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
             &session,
             &mut statuses,
             &state.config.server_id,
-            &state.config.label,
+            &current_server_label(&state.config.label),
             &session.id,
         )
         .await
@@ -2025,7 +2061,7 @@ async fn watch_agent_notifications(state: AppState, session: SessionConfig) {
                                 &event,
                                 &mut statuses,
                                 &state.config.server_id,
-                                &state.config.label,
+                                &current_server_label(&state.config.label),
                                 &session.id,
                             ) {
                                 deliver_agent_notification(&state, notification).await;
@@ -3342,7 +3378,59 @@ fn default_socket_path() -> String {
 }
 
 fn hostname_label() -> String {
-    std::env::var("HOSTNAME").unwrap_or_else(|_| "Herdr Server".into())
+    // HOSTNAME is often unset on macOS, which left every server named the
+    // generic "Herdr Server". Fall back to the real machine name so a fresh
+    // install is at least recognisable before the user renames it.
+    if let Ok(value) = std::env::var("HOSTNAME") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(output) = std::process::Command::new("hostname").output() {
+        if let Ok(name) = String::from_utf8(output.stdout) {
+            let name = name.trim().trim_end_matches(".local").trim();
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    "Herdr Server".into()
+}
+
+/// Persist a new display label into the config (and the pairing payload), so a
+/// name set from the app shows up in push notifications. Mirrors
+/// `update_public_url`.
+fn update_server_label(label: &str) -> anyhow::Result<String> {
+    let label = label.trim();
+    anyhow::ensure!(
+        !label.is_empty()
+            && label.chars().count() <= MAX_DEVICE_NAME_CHARS
+            && !label.chars().any(char::is_control),
+        "label must be non-empty, at most {MAX_DEVICE_NAME_CHARS} characters, and free of control characters"
+    );
+    let config_path = config_dir()?.join(CONFIG_FILE);
+    let mut config = load_config(None)?;
+    config.label = label.to_string();
+    write_secret_file(&config_path, &serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("failed to write config {}", config_path.display()))?;
+
+    if let Ok(mut pairing) = read_pairing_file() {
+        pairing.payload.label = label.to_string();
+        let _ = write_secret_file(
+            &config_dir()?.join(PAIRING_FILE),
+            &serde_json::to_vec_pretty(&pairing)?,
+        );
+    }
+    Ok(label.to_string())
+}
+
+/// The label as it stands on disk right now, so a rename from the app takes
+/// effect for notifications without restarting the gateway.
+fn current_server_label(fallback: &str) -> String {
+    load_config(None)
+        .map(|config| config.label)
+        .unwrap_or_else(|_| fallback.to_string())
 }
 
 fn generate_token() -> String {
