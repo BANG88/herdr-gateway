@@ -17,10 +17,13 @@ Linux; Windows is not supported yet):
 curl -fsSL https://raw.githubusercontent.com/BANG88/herdr-gateway/main/install.sh | sh
 ```
 
-Herdr 0.7.5 installs plugins globally for the current user, so the plugin can be
-installed from any shell. Its setup, start, and pairing-QR actions still need a
-live herdr session; if none is reachable, the script installs the plugin and
-prints the manual commands to finish.
+Herdr Gateway requires Herdr 0.7.5 or newer. The installer checks this before
+Herdr reads the plugin manifest; on an older version it stops with the exact
+`herdr update --handoff` command instead of exposing an unrelated TOML parse
+error. Herdr 0.7.5 installs plugins globally for the current user, so the plugin
+can be installed from any shell. Its setup, start, and pairing-QR actions still
+need a live herdr session; if none is reachable, the script installs the plugin
+and prints the manual commands to finish.
 
 It needs [Herdr](https://herdr.dev). Install downloads a prebuilt, statically
 linked binary for your platform, so no Rust toolchain is required -- it is only

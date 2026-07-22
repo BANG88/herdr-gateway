@@ -15,11 +15,34 @@ set -eu
 
 REPO="BANG88/herdr-gateway"
 PLUGIN_ID="herdr.gateway"
+MIN_HERDR_VERSION="0.7.5"
 
 green() { printf '\033[1;32m%s\033[0m\n' "$1"; }
 info()  { printf '\033[1;36m==>\033[0m %s\n' "$1"; }
 warn()  { printf '\033[1;33m!\033[0m  %s\n' "$1"; }
 die()   { printf '\033[1;31mError:\033[0m %s\n' "$1" >&2; exit 1; }
+
+version_at_least() {
+  awk -v current="$1" -v required="$2" '
+    BEGIN {
+      sub(/^v/, "", current)
+      sub(/^v/, "", required)
+      split(current, current_parts, ".")
+      split(required, required_parts, ".")
+
+      for (i = 1; i <= 3; i++) {
+        current_number = current_parts[i] + 0
+        required_number = required_parts[i] + 0
+        if (current_number > required_number) exit 0
+        if (current_number < required_number) exit 1
+      }
+
+      # A prerelease of the required stable version does not satisfy it.
+      if (current ~ /-/ && required !~ /-/) exit 1
+      exit 0
+    }
+  '
+}
 
 # 1. Operating system -- Windows is not supported yet.
 case "$(uname -s)" in
@@ -32,14 +55,32 @@ esac
 command -v herdr >/dev/null 2>&1 \
   || die "Herdr is not installed. Get it from https://herdr.dev first."
 
-# 3. Install downloads a prebuilt, statically linked binary, so Rust is optional
+# 3. Older Herdr versions parse the plugin manifest before checking its declared
+#    minimum version. Check here first so users get an actionable upgrade message
+#    instead of a TOML error for newer manifest fields such as `popup`.
+herdr_version="$(herdr --version 2>/dev/null | awk 'NR == 1 && $1 == "herdr" { print $2 }')"
+[ -n "$herdr_version" ] \
+  || die "Could not determine the installed Herdr version. Run 'herdr --version' and update Herdr before retrying."
+
+if ! version_at_least "$herdr_version" "$MIN_HERDR_VERSION"; then
+  warn "Herdr $herdr_version is too old. Herdr Gateway requires Herdr $MIN_HERDR_VERSION or newer."
+  echo
+  echo "Update Herdr first:"
+  echo "  herdr update --handoff"
+  echo
+  echo "Then run this installer again."
+  exit 1
+fi
+info "Detected Herdr $herdr_version"
+
+# 4. Install downloads a prebuilt, statically linked binary, so Rust is optional
 #    -- only needed as a fallback when no release binary matches this OS/arch.
 if ! command -v cargo >/dev/null 2>&1; then
   warn "Rust (cargo) not found. That is fine -- a prebuilt binary will be used."
   echo "   (If none matches your platform, install Rust from https://rustup.rs and retry.)"
 fi
 
-# 4. Install or update. Reinstalling a GitHub-managed plugin replaces its
+# 5. Install or update. Reinstalling a GitHub-managed plugin replaces its
 #    checkout in place -- no uninstall needed. A local dev link is the one case
 #    Herdr refuses to install over, so detect it and explain instead of failing.
 #    `existing` (captured before install) also tells first-install from update.
@@ -58,7 +99,7 @@ else
 fi
 herdr plugin install "$REPO" --yes
 
-# 5. Configure, (re)load, and show the pairing QR. setup is idempotent -- it
+# 6. Configure, (re)load, and show the pairing QR. setup is idempotent -- it
 #    keeps an existing server id, token, and URL, so running it every time is
 #    safe (paired devices survive) and also repairs an install whose earlier
 #    setup never completed. stop+start then reloads the freshly downloaded
